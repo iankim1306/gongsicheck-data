@@ -1,0 +1,70 @@
+name: daily-crawl
+
+on:
+  schedule:
+    # 매일 22:40 UTC = 07:40 KST
+    # 거래소 공시는 장중~저녁에 접수되므로 다음날 아침에 전일분이 확정된다.
+    - cron: "40 22 * * *"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "전체 재수집(180일) 여부 — 백필 시 true"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write   # 자기 저장소에 signals.json 을 커밋한다
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      # 직전 배포본이 곧 병합 베이스다.
+      # 증분 실행은 최근 10일만 다시 받으므로 나머지 170일은 여기서 온다.
+      - name: Seed previous data
+        run: |
+          mkdir -p crawler/data
+          cp signals.json crawler/data/signals.json || true
+
+      - name: Run DART risk crawler
+        env:
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+        working-directory: crawler
+        run: |
+          if [ "${{ github.event.inputs.full }}" = "true" ]; then
+            python crawl_risk.py --full
+          else
+            python crawl_risk.py
+          fi
+
+      # 수집이 실패해 빈 파일이 배포되면 앱이 통째로 비어 보인다.
+      # 최소 건수를 못 넘으면 커밋하지 않고 실패시킨다.
+      - name: Sanity check
+        run: |
+          python - <<'PY'
+          import json, sys
+          d = json.load(open("crawler/data/signals.json", encoding="utf-8"))
+          n = len(d.get("items", []))
+          print(f"items={n} updated_at={d.get('updated_at')}")
+          if n < 500:
+              print(f"ERROR: 건수가 비정상적으로 적다({n}) — 배포 중단", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Commit
+        run: |
+          cp crawler/data/signals.json signals.json
+          git config user.name  "gongsi-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add signals.json
+          git diff --staged --quiet && echo "변경 없음 — 커밋 생략" && exit 0
+          git commit -m "chore: signals $(date -u +%Y-%m-%d)"
+          git push
